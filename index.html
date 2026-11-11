@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bus KA20AB3781 Tracker</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#2563eb" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f3f4f6; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+    .card { background: white; border-radius: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); padding: 20px; width: 100%; max-width: 420px; }
+    h2 { margin-top: 0; color: #1f2937; font-size: 1.25rem; }
+    .status-badge { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; margin-bottom: 15px; }
+    .badge-connecting { background: #fef3c7; color: #92400e; }
+    .badge-connected { background: #dcfce7; color: #166534; }
+    .metric { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #e5e7eb; }
+    .metric span:first-child { color: #6b7280; }
+    .metric span:last-child { font-weight: 600; color: #111827; }
+    button { width: 100%; margin-top: 15px; padding: 12px; background: #2563eb; color: white; border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer; }
+    button:active { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <h2>🚌 Bus Live Geofence</h2>
+    <div id="statusBadge" class="status-badge badge-connecting">Connecting...</div>
+
+    <div class="metric">
+      <span>Bus Registration</span>
+      <span>KA20AB3781</span>
+    </div>
+    <div class="metric">
+      <span>Current Distance</span>
+      <span id="distVal">-- m</span>
+    </div>
+    <div class="metric">
+      <span>Speed</span>
+      <span id="speedVal">-- km/h</span>
+    </div>
+    <div class="metric">
+      <span>Last Update</span>
+      <span id="timeVal">--</span>
+    </div>
+
+    <button onclick="requestNotificationPermission()">Enable Push Alerts</button>
+  </div>
+
+  <script>
+    // --- 1. Target Destination Coordinates ---
+    const TARGET_LAT = 13.340880;
+    const TARGET_LON = 74.742143;
+    const ALERT_RADIUS_METERS = 400;
+
+    let alertFired = false;
+
+    // --- 2. Haversine Distance Calculation ---
+    function getDistance(lat1, lon1, lat2, lon2) {
+      const R = 6371e3;
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat/2)**2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2)**2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    function requestNotificationPermission() {
+      if ("Notification" in window) {
+        Notification.requestPermission().then(perm => {
+          alert("Notification permission: " + perm);
+        });
+      }
+    }
+
+    // --- 3. MQTT over WebSockets Connection ---
+    // Note: If mqtt.uffizio.com does not support WSS directly, 
+    // traffic will route through a standard WebSocket bridge.
+    const client = new Paho.MQTT.Client("mqtt.uffizio.com", 15675, "/ws", "client_" + Math.random().toString(16).substring(2, 10));
+
+    client.onConnectionLost = (resp) => {
+      document.getElementById("statusBadge").className = "status-badge badge-connecting";
+      document.getElementById("statusBadge").innerText = "Reconnecting...";
+      setTimeout(connectMQTT, 5000);
+    };
+
+    client.onMessageArrived = (message) => {
+      try {
+        const payload = JSON.parse(message.payloadString);
+        let lat = payload.lat || payload.latitude;
+        let lng = payload.lng || payload.longitude;
+
+        if (payload.latlng && typeof payload.latlng === "string") {
+          const parts = payload.latlng.split(",");
+          lat = parseFloat(parts[0]);
+          lng = parseFloat(parts[1]);
+        }
+
+        if (lat && lng) {
+          const dist = Math.round(getDistance(lat, lng, TARGET_LAT, TARGET_LON));
+          const speed = payload.speed || 0;
+
+          document.getElementById("distVal").innerText = dist + " m";
+          document.getElementById("speedVal").innerText = speed + " km/h";
+          document.getElementById("timeVal").innerText = new Date().toLocaleTimeString();
+
+          if (dist <= ALERT_RADIUS_METERS && !alertFired) {
+            if (Notification.permission === "granted") {
+              new Notification("🚌 Bus Approaching!", {
+                body: `KA20AB3781 is ${dist}m away from destination.`,
+                icon: "/icon.png"
+              });
+            }
+            alertFired = true;
+          } else if (dist > ALERT_RADIUS_METERS * 2) {
+            alertFired = false;
+          }
+        }
+      } catch (err) {
+        console.error("Payload parse error", err);
+      }
+    };
+
+    function connectMQTT() {
+      client.connect({
+        userName: "admin",
+        password: "RabbitMQPass",
+        useSSL: true,
+        onSuccess: () => {
+          document.getElementById("statusBadge").className = "status-badge badge-connected";
+          document.getElementById("statusBadge").innerText = "Streaming Telemetry";
+
+          // Subscribe and trigger telemetry activation
+          client.subscribe("v_218802");
+          const handshake = new Paho.MQTT.Message(JSON.stringify({
+            vehicle_id: 218802,
+            topic: "v_218802",
+            type: "live",
+            track_type: "singlevehicle",
+            action: "start",
+            session_id: "pwa-" + Date.now()
+          }));
+          handshake.destinationName = "/config";
+          client.send(handshake);
+        },
+        onFailure: (err) => {
+          console.error("Connection failed", err);
+          document.getElementById("statusBadge").innerText = "Connection Error (TCP/WSS)";
+        }
+      });
+    }
+
+    connectMQTT();
+
+    // Register Service Worker for PWA
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("./sw.js");
+    }
+  </script>
+</body>
+</html>
